@@ -151,44 +151,30 @@ def poll_emails():
             uid_str = str(uid)
             if uid_str in existing_uids:
                 continue
-
             data = mail.fetch([uid], ['RFC822', 'FLAGS'])
             if uid not in data:
                 continue
-
             msg_data = data[uid]
             raw_email = msg_data[b'RFC822']
             flags = msg_data[b'FLAGS']
-
             msg = email.message_from_bytes(raw_email)
-
             subject = decode_str(msg['Subject'])
             sender = decode_str(msg['From'])
             date_str = msg['Date']
-
             try:
                 parsed_date = email.utils.parsedate_to_datetime(date_str)
                 timestamp = parsed_date.isoformat()
             except:
                 timestamp = datetime.now().isoformat()
-
             body, ct = get_body(msg)
-
             body_preview = strip_html(body)[:MAX_BODY_LEN]
             body_html = body[:MAX_HTML_LEN] if ct == "text/html" else body_preview
-
             is_unread = b'\\Seen' not in flags
-
             email_obj = {
-                "uid": uid_str,
-                "subject": subject,
-                "sender": sender,
-                "date": date_str,
-                "timestamp": timestamp,
-                "body": body_preview,
-                "body_html": body_html,
-                "is_read": not is_unread,
-                "is_unread_imap": is_unread
+                "uid": uid_str, "subject": subject, "sender": sender,
+                "date": date_str, "timestamp": timestamp,
+                "body": body_preview, "body_html": body_html,
+                "is_read": not is_unread, "is_unread_imap": is_unread
             }
             new_emails.append(email_obj)
 
@@ -215,23 +201,25 @@ def poll_loop():
         poll_emails()
         time.sleep(POLL_INTERVAL)
 
+# ★★★ 关键修复：在模块加载时立即启动轮询（gunicorn兼容）★★★
+os.makedirs(CACHE_DIR, exist_ok=True)
+load_cache()
+poll_emails()
+t = Thread(target=poll_loop, daemon=True)
+t.start()
+logging.info("服务启动，邮箱 %s，轮询间隔 %ds", HARD_CODED_EMAIL, POLL_INTERVAL)
+
 @app.route('/api/emails')
 def get_emails():
     emails = []
     for e in mail_cache.get('emails', []):
         emails.append({
-            "uid": e['uid'],
-            "subject": e['subject'],
-            "sender": e['sender'],
-            "date": e['date'],
-            "timestamp": e['timestamp'],
-            "body": e['body'],
-            "is_read": e['is_read'],
-            "is_unread_imap": e.get('is_unread_imap', False)
+            "uid": e['uid'], "subject": e['subject'], "sender": e['sender'],
+            "date": e['date'], "timestamp": e['timestamp'], "body": e['body'],
+            "is_read": e['is_read'], "is_unread_imap": e.get('is_unread_imap', False)
         })
     return jsonify({
-        "emails": emails,
-        "last_poll": mail_cache.get('last_poll'),
+        "emails": emails, "last_poll": mail_cache.get('last_poll'),
         "unread_count": mail_cache.get('unread_count', 0)
     })
 
@@ -240,15 +228,10 @@ def get_email(uid):
     for e in mail_cache.get('emails', []):
         if e['uid'] == uid:
             return jsonify({
-                "uid": e['uid'],
-                "subject": e['subject'],
-                "sender": e['sender'],
-                "date": e['date'],
-                "timestamp": e['timestamp'],
-                "body": e['body'],
-                "body_html": e.get('body_html', e['body']),
-                "is_read": e['is_read'],
-                "is_unread_imap": e.get('is_unread_imap', False)
+                "uid": e['uid'], "subject": e['subject'], "sender": e['sender'],
+                "date": e['date'], "timestamp": e['timestamp'],
+                "body": e['body'], "body_html": e.get('body_html', e['body']),
+                "is_read": e['is_read'], "is_unread_imap": e.get('is_unread_imap', False)
             })
     return jsonify({"error": "not found"}), 404
 
@@ -271,11 +254,5 @@ def mark_read(uid):
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    load_cache()
-    poll_emails()
-    t = Thread(target=poll_loop, daemon=True)
-    t.start()
     port = int(os.getenv("PORT", "20044"))
-    logging.info("服务启动，端口 %d，邮箱 %s", port, HARD_CODED_EMAIL)
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)

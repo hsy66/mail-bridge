@@ -291,6 +291,7 @@ func extractRawHTML(rawEmail string) string {
 		decoded, err := decodeBody([]byte(bodyText), encoding)
 		if err != nil { decoded = []byte(bodyText) }
 		result := string(decoded)
+		result = cleanURLs(result)
 		if len(result) > 50000 { result = result[:50000] }
 		return result
 	}
@@ -310,6 +311,7 @@ func extractRawHTML(rawEmail string) string {
 				decoded, err := decodeBody(body, partEnc)
 				if err != nil { decoded = body }
 				result := string(decoded)
+				result = cleanURLs(result)
 				if len(result) > 50000 { result = result[:50000] }
 				return result
 			}
@@ -320,9 +322,43 @@ func extractRawHTML(rawEmail string) string {
 	return extractTextBody(rawEmail)
 }
 
+// cleanURLs 清理图片链接里的无效字符（如邮件自带的 \x01-\x1f 控制字符）
+func cleanURLs(html string) string {
+	re := regexp.MustCompile(`src="[^"]*"`)
+	return re.ReplaceAllStringFunc(html, func(src string) string {
+		url := src[5 : len(src)-1]
+		clean := strings.Map(func(r rune) rune {
+			if r >= 0x00 && r <= 0x1f {
+				return -1
+			}
+			return r
+		}, url)
+		return `src="` + clean + `"`
+	})
+}
+
 func parseDate(s string) string {
-	for _, f := range []string{"Mon, 02 Jan 2006 15:04:05 -0700", "Mon, 2 Jan 2006 15:04:05 -0700", "02 Jan 2006 15:04:05 -0700"} {
-		if t, err := time.Parse(f, s); err == nil { return t.Format(time.RFC3339) }
+	// 清理日期字符串中的额外格式
+	s = strings.TrimSpace(s)
+	// 移除 (UTC)、(CST)、(PDT) 等额外文本
+	if idx := strings.Index(s, "("); idx > 0 {
+		s = strings.TrimSpace(s[:idx])
+	}
+	// 标准 RFC 1123 格式
+	for _, f := range []string{
+		"Mon, 02 Jan 2006 15:04:05 -0700",
+		"Mon, 2 Jan 2006 15:04:05 -0700",
+		"02 Jan 2006 15:04:05 -0700",
+		"Mon, 02 Jan 2006 15:04:05 MST",
+		"Mon, 02 Jan 2006 15:04:05 Z0700",
+		"Mon, 2 Jan 2006 15:04:05 Z0700",
+		"2006-01-02 15:04:05 -0700",
+		"2006-01-02T15:04:05-0700",
+		"2006-01-02T15:04:05Z",
+	} {
+		if t, err := time.Parse(f, s); err == nil {
+			return t.Format(time.RFC3339)
+		}
 	}
 	return time.Now().Format(time.RFC3339)
 }

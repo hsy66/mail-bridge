@@ -11,7 +11,6 @@ import (
 	"log"
 	"mime"
 	"mime/multipart"
-	"mime/quotedprintable"
 	"net"
 	"net/http"
 	"os"
@@ -134,10 +133,41 @@ func decodeBody(body []byte, encoding string) ([]byte, error) {
 		clean := strings.NewReplacer("\n", "", "\r", "", " ", "").Replace(string(body))
 		return base64.StdEncoding.DecodeString(clean)
 	case "quoted-printable":
-		return io.ReadAll(quotedprintable.NewReader(strings.NewReader(string(body))))
+		return laxQPDecode(body), nil
 	default:
+		// 尝试 QP 解码，如果生成长度不同则有效
+		decoded := laxQPDecode(body)
+		if len(decoded) != len(body) {
+			return decoded, nil
+		}
 		return body, nil
 	}
+}
+
+// laxQPDecode 宽容的 QP 解码器 — 不严格的软换行处理，兼容 Gmail/OpenAI 等
+func laxQPDecode(data []byte) []byte {
+	var result []byte
+	i := 0
+	for i < len(data) {
+		if data[i] == '=' && i+2 < len(data) && isHex(data[i+1]) && isHex(data[i+2]) {
+			b, _ := strconv.ParseUint(string(data[i+1:i+3]), 16, 8)
+			result = append(result, byte(b))
+			i += 3
+		} else if data[i] == '=' && i+1 < len(data) && (data[i+1] == '\n' || data[i+1] == '\r') {
+			// 软换行，跳过 =\n 或 =\r\n
+			i++
+			if i < len(data) && data[i] == '\r' { i++ }
+			if i < len(data) && data[i] == '\n' { i++ }
+		} else {
+			result = append(result, data[i])
+			i++
+		}
+	}
+	return result
+}
+
+func isHex(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')
 }
 
 // extractTextBody 使用标准 MIME 解析提取正文（与 Python 版逻辑一致）
@@ -241,6 +271,7 @@ func extractRawHTML(rawEmail string) string {
 	headerText := raw[:idx]
 	ct := "text/plain"
 	boundary := ""
+	encoding := ""
 	for _, line := range strings.Split(headerText, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(strings.ToLower(line), "content-type:") {
@@ -250,12 +281,18 @@ func extractRawHTML(rawEmail string) string {
 				if b, ok := params["boundary"]; ok { boundary = b }
 			}
 		}
+		if strings.HasPrefix(strings.ToLower(line), "content-transfer-encoding:") {
+			encoding = strings.TrimSpace(strings.TrimPrefix(strings.ToLower(line), "content-transfer-encoding:"))
+		}
 	}
 
-	// 如果是 HTML，返回原始 HTML（截断到 50000）
+	// 如果是 HTML，解码后返回（截断到 50000）
 	if strings.HasPrefix(ct, "text/html") {
-		if len(bodyText) > 50000 { bodyText = bodyText[:50000] }
-		return bodyText
+		decoded, err := decodeBody([]byte(bodyText), encoding)
+		if err != nil { decoded = []byte(bodyText) }
+		result := string(decoded)
+		if len(result) > 50000 { result = result[:50000] }
+		return result
 	}
 
 	// 如果是 multipart，找 HTML 部分

@@ -6,9 +6,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"mime"
+	"mime/multipart"
 	"mime/quotedprintable"
 	"net"
 	"net/http"
@@ -39,6 +41,7 @@ type Email struct {
 	Date         string `json:"date"`
 	Timestamp    string `json:"timestamp"`
 	Body         string `json:"body"`
+	BodyHTML     string `json:"body_html,omitempty"`
 	IsRead       bool   `json:"is_read"`
 	IsUnreadIMAP bool   `json:"is_unread_imap"`
 }
@@ -102,52 +105,182 @@ func decodeMIME(s string) string {
 	return d
 }
 
-var boundaryRe = regexp.MustCompile(`boundary="?([^"\s;]+)"?`)
+func stripHTML(s string) string {
+	if s == "" { return "" }
+	// 先移除 style 和 script 块（Python 版没有这个，但应该加）
+	s = regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`).ReplaceAllString(s, "")
+	s = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`).ReplaceAllString(s, "")
+	// 替换换行元素
+	s = strings.NewReplacer("<br>", "\n", "<br/>", "\n", "<br />", "\n").Replace(s)
+	s = regexp.MustCompile(`</p>`).ReplaceAllString(s, "\n")
+	s = regexp.MustCompile(`</div>`).ReplaceAllString(s, "\n")
+	s = regexp.MustCompile(`</tr>`).ReplaceAllString(s, "\n")
+	s = regexp.MustCompile(`</td>`).ReplaceAllString(s, " ")
+	s = regexp.MustCompile(`<li>`).ReplaceAllString(s, "\n- ")
+	// 去掉所有 HTML 标签
+	s = regexp.MustCompile(`<[^>]+>`).ReplaceAllString(s, "")
+	// 解码 HTML 实体
+	s = html.UnescapeString(s)
+	// 清理空白
+	s = regexp.MustCompile(`\n\s*\n+`).ReplaceAllString(s, "\n\n")
+	s = regexp.MustCompile(`[ 	]+`).ReplaceAllString(s, " ")
+	return strings.TrimSpace(s)
+}
 
-func extractTextBody(raw string) string {
-	parts := []string{raw}
-	if m := boundaryRe.FindStringSubmatch(raw); m != nil {
-		parts = strings.Split(raw, "--"+m[1])
+// decodeBody 根据 Content-Transfer-Encoding 解码 body
+func decodeBody(body []byte, encoding string) ([]byte, error) {
+	switch strings.ToLower(encoding) {
+	case "base64":
+		clean := strings.NewReplacer("\n", "", "\r", "", " ", "").Replace(string(body))
+		return base64.StdEncoding.DecodeString(clean)
+	case "quoted-printable":
+		return io.ReadAll(quotedprintable.NewReader(strings.NewReader(string(body))))
+	default:
+		return body, nil
 	}
-	for _, part := range parts {
-		lower := strings.ToLower(part)
-		isPlain := strings.Contains(lower, "content-type: text/plain")
-		isHTML := strings.Contains(lower, "content-type: text/html")
-		if !isPlain && !isHTML { continue }
-		encoding := ""
-		for _, l := range strings.Split(part, "\n") {
-			l = strings.TrimRight(l, "\r")
-			if strings.HasPrefix(strings.ToLower(l), "content-transfer-encoding:") {
-				encoding = strings.TrimSpace(strings.TrimPrefix(strings.ToLower(l), "content-transfer-encoding:"))
+}
+
+// extractTextBody 使用标准 MIME 解析提取正文（与 Python 版逻辑一致）
+func extractTextBody(rawEmail string) string {
+	// 先合并折叠头
+	raw := mergeHeaders(rawEmail)
+
+	// 分离头部和正文
+	idx := strings.Index(raw, "\n\n")
+	if idx < 0 { return "" }
+	headerText := raw[:idx]
+	bodyText := raw[idx+2:]
+
+	// 解析 Content-Type
+	ct := "text/plain"
+	charset := "utf-8"
+	boundary := ""
+	for _, line := range strings.Split(headerText, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToLower(line), "content-type:") {
+			// 用 mime 包解析媒体类型
+			mt, params, err := mime.ParseMediaType(strings.TrimPrefix(line, "Content-Type:"))
+			if err == nil {
+				ct = mt
+				if c, ok := params["charset"]; ok { charset = c }
+				if b, ok := params["boundary"]; ok { boundary = b }
 			}
 		}
-		var bl []string
-		started := false
-		for _, l := range strings.Split(part, "\n") {
-			l = strings.TrimRight(l, "\r")
-			if !started { if l == "" { started = true }; continue }
-			if strings.HasPrefix(l, "--") || strings.HasPrefix(l, "Content-") { break }
-			bl = append(bl, l)
-		}
-		result := strings.Join(bl, "\n")
-		switch {
-		case strings.Contains(encoding, "base64"):
-			clean := strings.NewReplacer("\n", "", "\r", "").Replace(result)
-			if d, err := base64.StdEncoding.DecodeString(clean); err == nil { result = string(d) }
-		case strings.Contains(encoding, "quoted-printable"):
-			if d, err := io.ReadAll(quotedprintable.NewReader(strings.NewReader(result))); err == nil { result = string(d) }
-		}
-		if isHTML && !isPlain {
-			var sb strings.Builder
-			inTag := false
-			for _, c := range result { if c == '<' { inTag = true } else if c == '>' { inTag = false } else if !inTag { sb.WriteRune(c) } }
-			result = sb.String()
-		}
-		result = strings.TrimSpace(result)
-		if len(result) > 1000 { result = result[:1000] }
-		if result != "" { return result }
 	}
-	return ""
+
+	// 如果没找到 encoding 则从头部找
+	encoding := ""
+	for _, line := range strings.Split(headerText, "\n") {
+		if strings.HasPrefix(strings.ToLower(line), "content-transfer-encoding:") {
+			encoding = strings.TrimSpace(strings.TrimPrefix(strings.ToLower(line), "content-transfer-encoding:"))
+		}
+	}
+
+	// 处理 multipart
+	var htmlFallback string
+	if strings.HasPrefix(ct, "multipart/") && boundary != "" {
+		mr := multipart.NewReader(strings.NewReader(bodyText), boundary)
+		for {
+			p, err := mr.NextPart()
+			if err != nil { break }
+			
+			partCt := p.Header.Get("Content-Type")
+			partEnc := p.Header.Get("Content-Transfer-Encoding")
+			body, _ := io.ReadAll(p)
+
+			// 解码
+			decoded, err := decodeBody(body, partEnc)
+			if err != nil { decoded = body }
+
+			mt, _, _ := mime.ParseMediaType(partCt)
+			switch mt {
+			case "text/plain":
+				result := strings.TrimSpace(string(decoded))
+				if len(result) > 1000 { result = result[:1000] }
+				return result
+			case "text/html":
+				if extracted := extractFromHTML(decoded, charset); extracted != "" {
+					htmlFallback = extracted
+				}
+			}
+		}
+		if htmlFallback != "" { return htmlFallback }
+		return ""
+	}
+
+	// 非 multipart
+	switch {
+	case strings.HasPrefix(ct, "text/html"):
+		decoded, err := decodeBody([]byte(bodyText), encoding)
+		if err != nil { return "" }
+		return stripHTML(string(decoded))
+	default:
+		decoded, err := decodeBody([]byte(bodyText), encoding)
+		if err != nil { return "" }
+		result := string(decoded)
+		if len(result) > 1000 { result = result[:1000] }
+		return strings.TrimSpace(result)
+	}
+}
+
+func extractFromHTML(data []byte, charset string) string {
+	text := string(data)
+	text = stripHTML(text)
+	if len(text) > 1000 { text = text[:1000] }
+	return strings.TrimSpace(text)
+}
+
+// extractRawHTML 提取原始 HTML 正文（与 Python 版的 body_html 对应）
+func extractRawHTML(rawEmail string) string {
+	raw := mergeHeaders(rawEmail)
+	idx := strings.Index(raw, "\n\n")
+	if idx < 0 { return "" }
+	bodyText := raw[idx+2:]
+
+	// 分离头部
+	headerText := raw[:idx]
+	ct := "text/plain"
+	boundary := ""
+	for _, line := range strings.Split(headerText, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToLower(line), "content-type:") {
+			mt, params, err := mime.ParseMediaType(strings.TrimPrefix(line, "Content-Type:"))
+			if err == nil {
+				ct = mt
+				if b, ok := params["boundary"]; ok { boundary = b }
+			}
+		}
+	}
+
+	// 如果是 HTML，返回原始 HTML（截断到 50000）
+	if strings.HasPrefix(ct, "text/html") {
+		if len(bodyText) > 50000 { bodyText = bodyText[:50000] }
+		return bodyText
+	}
+
+	// 如果是 multipart，找 HTML 部分
+	if strings.HasPrefix(ct, "multipart/") && boundary != "" {
+		mr := multipart.NewReader(strings.NewReader(bodyText), boundary)
+		for {
+			p, err := mr.NextPart()
+			if err != nil { break }
+			partCt := p.Header.Get("Content-Type")
+			partEnc := p.Header.Get("Content-Transfer-Encoding")
+			body, _ := io.ReadAll(p)
+
+			mt, _, _ := mime.ParseMediaType(partCt)
+			if mt == "text/html" {
+				decoded, err := decodeBody(body, partEnc)
+				if err != nil { decoded = body }
+				result := string(decoded)
+				if len(result) > 50000 { result = result[:50000] }
+				return result
+			}
+		}
+	}
+
+	// 非 HTML：返回和 body 一样的纯文本
+	return extractTextBody(rawEmail)
 }
 
 func parseDate(s string) string {
@@ -247,9 +380,10 @@ func pollEmails() {
 			}
 		}
 		body := extractTextBody(rawEmail)
+		bodyHTML := extractRawHTML(rawEmail)
 		newEmails = append(newEmails, Email{
 			UID: fmt.Sprintf("%d", uid), Subject: subj, Sender: from,
-			Date: date, Timestamp: parseDate(date), Body: body,
+			Date: date, Timestamp: parseDate(date), Body: body, BodyHTML: bodyHTML,
 			IsRead: !isUnread, IsUnreadIMAP: isUnread,
 		})
 	}

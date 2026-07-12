@@ -144,7 +144,7 @@ func decodeBody(body []byte, encoding string) ([]byte, error) {
 	}
 }
 
-// laxQPDecode 宽容的 QP 解码器 — 不严格的软换行处理，兼容 Gmail/OpenAI 等
+// laxQPDecode 宽容的 QP 解码器
 func laxQPDecode(data []byte) []byte {
 	var result []byte
 	i := 0
@@ -153,11 +153,21 @@ func laxQPDecode(data []byte) []byte {
 			b, _ := strconv.ParseUint(string(data[i+1:i+3]), 16, 8)
 			result = append(result, byte(b))
 			i += 3
-		} else if data[i] == '=' && i+1 < len(data) && (data[i+1] == '\n' || data[i+1] == '\r') {
-			// 软换行，跳过 =\n 或 =\r\n
-			i++
-			if i < len(data) && data[i] == '\r' { i++ }
-			if i < len(data) && data[i] == '\n' { i++ }
+		} else if data[i] == '=' {
+			// 软换行：跳过 =\n、=\r\n、= \n、=  \n
+			j := i + 1
+			for j < len(data) && (data[j] == ' ' || data[j] == '	') {
+				j++
+			}
+			if j < len(data) && (data[j] == '\n' || data[j] == '\r') {
+				i = j + 1
+				if i < len(data) && data[i] == '\n' {
+					i++
+				}
+			} else {
+				result = append(result, data[i])
+				i++
+			}
 		} else {
 			result = append(result, data[i])
 			i++

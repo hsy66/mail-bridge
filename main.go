@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,6 +49,7 @@ var (
 	unreadCnt int
 )
 
+// ========== IMAP 连接（正确处理 Literal） ==========
 type imapConn struct {
 	conn net.Conn
 	br   *bufio.Reader
@@ -56,16 +59,15 @@ type imapConn struct {
 func dialIMAP() (*imapConn, error) {
 	tcp, err := net.DialTimeout("tcp", "imap.163.com:993", 30*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("dial: %w", err)
+		return nil, err
 	}
 	tlsCfg := &tls.Config{ServerName: "imap.163.com"}
 	tlsConn := tls.Client(tcp, tlsCfg)
 	if err := tlsConn.Handshake(); err != nil {
-		return nil, fmt.Errorf("tls: %w", err)
+		return nil, err
 	}
 	c := &imapConn{conn: tlsConn, br: bufio.NewReader(tlsConn), tag: 1}
-	// 读欢迎
-	_, _ = c.readLine()
+	c.readLine() // read greeting
 	return c, nil
 }
 
@@ -73,10 +75,7 @@ func (c *imapConn) cmd(format string, args ...interface{}) string {
 	c.tag++
 	tag := fmt.Sprintf("a%04d", c.tag)
 	line := fmt.Sprintf(format, args...)
-	_, err := fmt.Fprintf(c.conn, "%s %s\r\n", tag, line)
-	if err != nil {
-		return ""
-	}
+	fmt.Fprintf(c.conn, "%s %s\r\n", tag, line)
 	return tag
 }
 
@@ -88,188 +87,67 @@ func (c *imapConn) readLine() (string, error) {
 	return strings.TrimRight(line, "\r\n"), nil
 }
 
-func (c *imapConn) readUntil(tag string) ([]string, error) {
-	var lines []string
+// readResponse 读取 IMAP 响应，正确处理 Literal {size}
+func (c *imapConn) readResponses(tag string) ([]string, error) {
+	var all []string
+	literalRe := regexp.MustCompile(`\{(\d+)\}$`)
 	for {
 		line, err := c.readLine()
 		if err != nil {
-			return lines, err
+			return all, err
 		}
-		if strings.HasPrefix(line, tag) {
-			lines = append(lines, line)
-			return lines, nil
+		// 检查是否 literal
+		if m := literalRe.FindStringSubmatch(line); m != nil {
+			size, _ := strconv.Atoi(m[1])
+			// 读 literal 数据
+			literal := make([]byte, size)
+			_, err := c.br.Read(literal)
+			if err != nil {
+				return all, err
+			}
+			all = append(all, line)
+			all = append(all, string(literal))
+			// 读 literal 后的换行
+			c.readLine()
+		} else {
+			all = append(all, line)
 		}
-		if strings.HasPrefix(line, "*") || strings.HasPrefix(line, "+") {
-			lines = append(lines, line)
+		if strings.HasPrefix(line, tag+" ") || strings.HasPrefix(line, tag+" OK") || strings.HasPrefix(line, tag+" NO") || strings.HasPrefix(line, tag+" BAD") {
+			return all, nil
 		}
 	}
 }
 
-func (c *imapConn) readUntilTag(tag string) (string, error) {
-	for {
-		line, err := c.readLine()
-		if err != nil {
-			return "", err
-		}
-		if strings.HasPrefix(line, tag) {
-			return line, nil
-		}
+// ========== MIME 解码 ==========
+func decodeMIMEHeader(s string) string {
+	if !strings.Contains(s, "=?") {
+		return s
 	}
+	dec := new(mime.WordDecoder)
+	d, err := dec.DecodeHeader(s)
+	if err != nil {
+		return s
+	}
+	return d
 }
 
-func (c *imapConn) close() {
-	c.conn.Close()
-}
-
-func pollEmails() {
-	mail, err := dialIMAP()
-	if err != nil {
-		log.Printf("连接失败: %v", err)
-		return
-	}
-	defer mail.close()
-
-	// 先发 ID 命令（163 邮箱需要）
-	mail.cmd("ID (\"name\" \"Microsoft Outlook\" \"version\" \"16.0\")")
-	mail.readUntilTag("a")
-
-	// 登录
-	tag := mail.cmd("LOGIN %s %s", email, password)
-	_, err = mail.readUntil(tag)
-	if err != nil {
-		log.Printf("登录失败: %v", err)
-		return
-	}
-
-	// Select INBOX
-	tag = mail.cmd("SELECT INBOX")
-	lines, err := mail.readUntil(tag)
-	if err != nil {
-		log.Printf("select失败: %v", err)
-		return
-	}
-	// 确认 OK
-	last := lines[len(lines)-1]
-	if strings.Contains(last, "NO") {
-		log.Printf("select被拒: %s", last)
-		return
-	}
-
-	// 搜索所有邮件
-	tag = mail.cmd("UID SEARCH ALL")
-	lines, err = mail.readUntil(tag)
-	if err != nil {
-		return
-	}
-
-	// 解析 UID 列表
-	var allUIDs []uint32
-	for _, l := range lines {
-		if strings.HasPrefix(l, "* SEARCH") {
-			parts := strings.Fields(l)
-			for _, p := range parts[2:] {
-				if uid, err := strconv.ParseUint(p, 10, 32); err == nil {
-					allUIDs = append(allUIDs, uint32(uid))
-				}
-			}
-		}
-	}
-
-	if len(allUIDs) == 0 {
-		return
-	}
-
-	// 只取最近 20 封
-	if len(allUIDs) > 20 {
-		allUIDs = allUIDs[len(allUIDs)-20:]
-	}
-
-	// 获取已有 UID
-	cacheMu.RLock()
-	existing := make(map[uint32]bool)
-	for _, e := range cache {
-		if uid, err := strconv.ParseUint(e.UID, 10, 32); err == nil {
-			existing[uint32(uid)] = true
-		}
-	}
-	cacheMu.RUnlock()
-
-	var newEmails []Email
-	for _, uid := range allUIDs {
-		if existing[uid] {
-			continue
-		}
-
-		// 获取邮件（含正文）
-		tag = mail.cmd("UID FETCH %d (BODY[] FLAGS)", uid)
-		lines, _ = mail.readUntil(tag)
-
-		var rawBody string
-		inBody := false
-		isUnread := true
-		for _, l := range lines {
-			if strings.Contains(l, "\\Seen") {
-				isUnread = false
-			}
-			if strings.Contains(l, "BODY[") {
-				inBody = true
-				continue
-			}
-			if inBody {
-				if strings.HasPrefix(l, ")") || strings.HasPrefix(l, "a") || l == "" {
-					break
-				}
-				rawBody += l + "\n"
-			}
-		}
-
-		subject, from, date, body := parseEmail(rawBody)
-		ts := parseDate(date)
-		if len(body) > 1000 {
-			body = body[:1000]
-		}
-
-		newEmails = append(newEmails, Email{
-			UID:          fmt.Sprintf("%d", uid),
-			Subject:      subject,
-			Sender:       from,
-			Date:         date,
-			Timestamp:    ts,
-			Body:         stripHTML(body),
-			IsRead:       !isUnread,
-			IsUnreadIMAP: isUnread,
-		})
-	}
-
-	if len(newEmails) > 0 {
-		cacheMu.Lock()
-		for _, e := range newEmails {
-			cache = append(cache, e)
-		}
-		sort.Slice(cache, func(i, j int) bool {
-			return cache[i].Timestamp > cache[j].Timestamp
-		})
-		if len(cache) > 20 {
-			cache = cache[:20]
-		}
-		unreadCnt = 0
-		for _, e := range cache {
-			if !e.IsRead {
-				unreadCnt++
-			}
-		}
-		lastPoll = time.Now().Format(time.RFC3339)
-		cacheMu.Unlock()
-		log.Printf("新增 %d 封，未读 %d，共 %d 封", len(newEmails), unreadCnt, len(cache))
-	}
-}
-
+// ========== 邮件解析 ==========
 func parseEmail(raw string) (subject, from, date, body string) {
+	// 合并折叠头
 	lines := strings.Split(raw, "\n")
-	inHeaders := true
-	var headerLines, bodyLines []string
+	var merged []string
 	for _, l := range lines {
 		l = strings.TrimRight(l, "\r")
+		if len(l) > 0 && (l[0] == ' ' || l[0] == '\t') && len(merged) > 0 {
+			merged[len(merged)-1] += " " + strings.TrimSpace(l)
+		} else {
+			merged = append(merged, l)
+		}
+	}
+
+	inHeaders := true
+	var headerLines, bodyLines []string
+	for _, l := range merged {
 		if inHeaders {
 			if l == "" {
 				inHeaders = false
@@ -290,7 +168,69 @@ func parseEmail(raw string) (subject, from, date, body string) {
 		}
 	}
 
-	return headers["subject"], headers["from"], headers["date"], strings.Join(bodyLines, "\n")
+	subject = decodeMIMEHeader(headers["subject"])
+	from = decodeMIMEHeader(headers["from"])
+	date = headers["date"]
+	rawBody := strings.Join(bodyLines, "\n")
+
+	// 提取正文（优先 text/plain）
+	body = extractTextBody(rawBody)
+	return
+}
+
+func extractTextBody(raw string) string {
+	// 从 multipart 中找 text/plain 或 text/html
+	plainIdx := strings.Index(raw, "Content-Type: text/plain")
+	htmlIdx := strings.Index(raw, "Content-Type: text/html")
+
+	var targetIdx int
+	isHTML := false
+	if plainIdx >= 0 {
+		targetIdx = plainIdx
+	} else if htmlIdx >= 0 {
+		targetIdx = htmlIdx
+		isHTML = true
+	} else {
+		if len(raw) > 1000 {
+			return raw[:1000]
+		}
+		return raw
+	}
+
+	body := raw[targetIdx:]
+	lines := strings.Split(body, "\n")
+	started := false
+	var textLines []string
+	for _, l := range lines {
+		l = strings.TrimRight(l, "\r")
+		if !started {
+			if l == "" {
+				started = true
+			}
+			continue
+		}
+		if strings.HasPrefix(l, "--") || strings.HasPrefix(l, "Content-") {
+			break
+		}
+		textLines = append(textLines, l)
+	}
+
+	result := strings.Join(textLines, "\n")
+	if isHTML {
+		var r strings.Builder
+		inTag := false
+		for _, c := range result {
+			if c == '<' {
+				inTag = true
+			} else if c == '>' {
+				inTag = false
+			} else if !inTag {
+				r.WriteRune(c)
+			}
+		}
+		result = r.String()
+	}
+	return strings.TrimSpace(result)
 }
 
 func parseDate(s string) string {
@@ -308,19 +248,162 @@ func parseDate(s string) string {
 	return time.Now().Format(time.RFC3339)
 }
 
-func stripHTML(s string) string {
-	var r strings.Builder
-	inTag := false
-	for _, c := range s {
-		if c == '<' {
-			inTag = true
-		} else if c == '>' {
-			inTag = false
-		} else if !inTag {
-			r.WriteRune(c)
+// ========== IMAP 轮询 ==========
+func pollEmails() {
+	mail, err := dialIMAP()
+	if err != nil {
+		log.Printf("连接失败: %v", err)
+		return
+	}
+	defer mail.conn.Close()
+
+	// ID + 登录
+	tag := mail.cmd(`ID ("name" "Microsoft Outlook" "version" "16.0")`)
+	mail.readResponses(tag)
+
+	tag = mail.cmd("LOGIN %s %s", email, password)
+	resp, err := mail.readResponses(tag)
+	if err != nil {
+		log.Printf("登录失败: %v", err)
+		return
+	}
+	if !strings.Contains(resp[len(resp)-1], "OK") {
+		log.Printf("登录被拒")
+		return
+	}
+
+	tag = mail.cmd("SELECT INBOX")
+	resp, err = mail.readResponses(tag)
+	if err != nil || !strings.Contains(resp[len(resp)-1], "OK") {
+		log.Printf("select失败")
+		return
+	}
+
+	// 搜索
+	tag = mail.cmd("UID SEARCH ALL")
+	resp, err = mail.readResponses(tag)
+	if err != nil {
+		return
+	}
+
+	var allUIDs []uint32
+	for _, l := range resp {
+		if strings.HasPrefix(l, "* SEARCH") {
+			parts := strings.Fields(l)
+			for _, p := range parts[2:] {
+				if uid, err := strconv.ParseUint(p, 10, 32); err == nil {
+					allUIDs = append(allUIDs, uint32(uid))
+				}
+			}
 		}
 	}
-	return strings.TrimSpace(r.String())
+	if len(allUIDs) == 0 {
+		return
+	}
+	if len(allUIDs) > 20 {
+		allUIDs = allUIDs[len(allUIDs)-20:]
+	}
+
+	cacheMu.RLock()
+	existing := make(map[uint32]bool)
+	for _, e := range cache {
+		if uid, err := strconv.ParseUint(e.UID, 10, 32); err == nil {
+			existing[uint32(uid)] = true
+		}
+	}
+	cacheMu.RUnlock()
+
+	var newEmails []Email
+	for _, uid := range allUIDs {
+		if existing[uid] {
+			continue
+		}
+
+		tag = mail.cmd("UID FETCH %d (BODY[] FLAGS)", uid)
+		resp, err = mail.readResponses(tag)
+		if err != nil {
+			continue
+		}
+
+		// 收集 literal 数据（即邮件正文）
+		var rawEmail string
+		isUnread := true
+		for _, l := range resp {
+			if strings.Contains(l, "\\Seen") {
+				isUnread = false
+			}
+			// literal 数据是原始邮件，包含所有头部和正文
+			if strings.HasPrefix(l, "Received:") || strings.HasPrefix(l, "From:") ||
+				strings.HasPrefix(l, "To:") || strings.HasPrefix(l, "Subject:") ||
+				strings.HasPrefix(l, "Date:") || strings.HasPrefix(l, "Message-ID:") ||
+				strings.HasPrefix(l, "MIME-Version:") || strings.HasPrefix(l, "Content-Type:") ||
+				strings.HasPrefix(l, "Content-Transfer-") || strings.HasPrefix(l, "DKIM-") ||
+				strings.HasPrefix(l, "X-") || strings.HasPrefix(l, "Authentication-") ||
+				strings.HasPrefix(l, "Received:") || strings.HasPrefix(l, "Return-") ||
+				strings.HasPrefix(l, "Delivered-") || strings.HasPrefix(l, "List-") ||
+				strings.HasPrefix(l, "Feedback-ID:") || strings.HasPrefix(l, "In-Reply-To:") ||
+				strings.HasPrefix(l, "References:") || strings.HasPrefix(l, "Reply-To:") ||
+				strings.HasPrefix(l, "Thread-") || strings.HasPrefix(l, "Archived-At:") ||
+				strings.HasPrefix(l, "Accept-Language:") || strings.HasPrefix(l, "Content-Language:") ||
+				strings.HasPrefix(l, "Sensitivity:") || strings.HasPrefix(l, "Precedence:") ||
+				strings.HasPrefix(l, "Auto-Submitted:") || strings.HasPrefix(l, "Priority:") ||
+				strings.HasPrefix(l, "Importance:") || strings.HasPrefix(l, "X-Mailer:") ||
+				strings.HasPrefix(l, "X-Priority:") || strings.HasPrefix(l, "X-MSMail-") ||
+				strings.HasPrefix(l, "User-Agent:") || l == "" {
+				rawEmail += l + "\n"
+			}
+		}
+
+		if rawEmail == "" {
+			// FETCH 响应可能是 literal 在前
+			for i, l := range resp {
+				if strings.Contains(l, "{") && i+1 < len(resp) {
+					rawEmail = resp[i+1]
+					break
+				}
+			}
+		}
+
+		subject, from, date, body := parseEmail(rawEmail)
+
+		newEmails = append(newEmails, Email{
+			UID:          fmt.Sprintf("%d", uid),
+			Subject:      subject,
+			Sender:       from,
+			Date:         date,
+			Timestamp:    parseDate(date),
+			Body:         body,
+			IsRead:       !isUnread,
+			IsUnreadIMAP: isUnread,
+		})
+	}
+
+	if len(newEmails) > 0 {
+		cacheMu.Lock()
+		cache = append(cache, newEmails...)
+		sort.Slice(cache, func(i, j int) bool {
+			return cache[i].Timestamp > cache[j].Timestamp
+		})
+		if len(cache) > 20 {
+			cache = cache[:20]
+		}
+		unreadCnt = 0
+		for _, e := range cache {
+			if !e.IsRead {
+				unreadCnt++
+			}
+		}
+		lastPoll = time.Now().Format(time.RFC3339)
+		cacheMu.Unlock()
+		log.Printf("新增 %d 封，未读 %d，共 %d 封", len(newEmails), unreadCnt, len(cache))
+	}
+}
+
+func pollLoop() {
+	for {
+		pollEmails()
+		time.Sleep(60 * time.Second)
+	}
 }
 
 // ========== HTTP ==========
@@ -337,23 +420,20 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "OPTIONS" {
 		return
 	}
-
 	p := r.URL.Path
+
 	switch {
 	case p == "/api/unread-count":
 		cacheMu.RLock()
 		apiResp(w, map[string]interface{}{
-			"unread_count": unreadCnt,
-			"last_poll":    lastPoll,
+			"unread_count": unreadCnt, "last_poll": lastPoll,
 		})
 		cacheMu.RUnlock()
 
 	case p == "/api/emails":
 		cacheMu.RLock()
 		apiResp(w, map[string]interface{}{
-			"emails":       cache,
-			"unread_count": unreadCnt,
-			"last_poll":    lastPoll,
+			"emails": cache, "unread_count": unreadCnt, "last_poll": lastPoll,
 		})
 		cacheMu.RUnlock()
 

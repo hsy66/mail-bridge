@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -144,7 +145,14 @@ func decodeBody(body []byte, encoding string) ([]byte, error) {
 	}
 }
 
-// laxQPDecode 宽容的 QP 解码器
+// removeOrphanEquals 移除解码后残留的 = 符号（QP软换行标记）
+func removeOrphanEquals(data []byte) []byte {
+	// 安全的：HTML/CSS 中 '= ' 总是 QP 软换行残留
+	// 正常 HTML 中 '=' 后面跟 '"' 或字母，不是空格
+	return bytes.ReplaceAll(data, []byte("= "), []byte{})
+}
+
+// laxQPDecode 宽容的 QP 解码器 — 处理不标准的软换行格式 (= =)
 func laxQPDecode(data []byte) []byte {
 	var result []byte
 	i := 0
@@ -154,16 +162,16 @@ func laxQPDecode(data []byte) []byte {
 			result = append(result, byte(b))
 			i += 3
 		} else if data[i] == '=' {
-			// 软换行：跳过 =\n、=\r\n、= \n、=  \n
+			// 软换行：= 后跟可选空格/tab/\r，再跟 \n
+			// 标准格式: =\r\n =\n
+			// 非标准格式: = \n (空格+换行)，邮件中常见
 			j := i + 1
-			for j < len(data) && (data[j] == ' ' || data[j] == '	') {
+			// 跳过空格、tab、\r
+			for j < len(data) && (data[j] == ' ' || data[j] == '	' || data[j] == '\r') {
 				j++
 			}
-			if j < len(data) && (data[j] == '\n' || data[j] == '\r') {
+			if j < len(data) && data[j] == '\n' {
 				i = j + 1
-				if i < len(data) && data[i] == '\n' {
-					i++
-				}
 			} else {
 				result = append(result, data[i])
 				i++
@@ -301,6 +309,7 @@ func extractRawHTML(rawEmail string) string {
 		decoded, err := decodeBody([]byte(bodyText), encoding)
 		if err != nil { decoded = []byte(bodyText) }
 		result := string(decoded)
+		result = string(removeOrphanEquals([]byte(result)))
 		result = cleanURLs(result)
 		if len(result) > 50000 { result = result[:50000] }
 		return result
@@ -321,6 +330,7 @@ func extractRawHTML(rawEmail string) string {
 				decoded, err := decodeBody(body, partEnc)
 				if err != nil { decoded = body }
 				result := string(decoded)
+				result = string(removeOrphanEquals([]byte(result)))
 				result = cleanURLs(result)
 				if len(result) > 50000 { result = result[:50000] }
 				return result

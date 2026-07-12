@@ -200,7 +200,7 @@ func pollEmails() {
 			continue
 		}
 
-		// 获取邮件
+		// 获取邮件（含正文）
 		tag = mail.cmd("UID FETCH %d (BODY[] FLAGS)", uid)
 		lines, _ = mail.readUntil(tag)
 
@@ -225,8 +225,8 @@ func pollEmails() {
 
 		subject, from, date, body := parseEmail(rawBody)
 		ts := parseDate(date)
-		if len(body) > 1000 {
-			body = body[:1000]
+		if len(body) > 200 {
+			body = body[:200]
 		}
 
 		newEmails = append(newEmails, Email{

@@ -311,7 +311,7 @@ func extractRawHTML(rawEmail string) string {
 		result := string(decoded)
 		result = string(removeOrphanEquals([]byte(result)))
 		result = cleanURLs(result)
-		if len(result) > 50000 { result = result[:50000] }
+		if len(result) > 500000 { result = result[:500000] }
 		return result
 	}
 
@@ -332,7 +332,7 @@ func extractRawHTML(rawEmail string) string {
 				result := string(decoded)
 				result = string(removeOrphanEquals([]byte(result)))
 				result = cleanURLs(result)
-				if len(result) > 50000 { result = result[:50000] }
+				if len(result) > 500000 { result = result[:500000] }
 				return result
 			}
 		}

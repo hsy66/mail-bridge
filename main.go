@@ -225,8 +225,8 @@ func pollEmails() {
 
 		subject, from, date, body := parseEmail(rawBody)
 		ts := parseDate(date)
-		if len(body) > 200 {
-			body = body[:200]
+		if len(body) > 1000 {
+			body = body[:1000]
 		}
 
 		newEmails = append(newEmails, Email{
